@@ -1,0 +1,7 @@
+# Everything the agent needs. STT / LLM / TTS are served by LiveKit Inference,
+# so no provider SDKs (OpenAI, Deepgram, ElevenLabs, Cartesia, ...) are required
+# and no provider API keys are used.
+livekit-agents>=1.8.1
+livekit-plugins-silero>=1.8.1
+livekit-plugins-turn-detector>=1.8.1
+python-dotenv>=1.0.1

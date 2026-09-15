@@ -1,0 +1,16 @@
+.env
+.env.local
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+transcripts/*.json
+!transcripts/.gitkeep
+.idea/
+.vscode/
+*.log
