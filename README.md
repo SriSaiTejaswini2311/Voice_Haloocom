@@ -200,11 +200,12 @@ Remove-Item Env:\LIVEKIT_URL, Env:\LIVEKIT_API_KEY, Env:\LIVEKIT_API_SECRET -Err
 
 Then talk to the agent in either of these ways:
 
-- **Terminal:** `python agent.py console` — fastest smoke test, plays audio through your machine.
-- **Browser (used for the demo):** open the LiveKit **Agent Console** at
-  `https://cloud.livekit.io/projects/<your-project>/agents/console`, allow microphone access and
-  start a session. This is the recommended console for this assignment — no custom frontend was
-  built.
+- **Terminal (used for the demo):** `lk agent console` — the LiveKit CLI console, which runs this
+  local worker and drives it from the terminal; `python agent.py console` is the equivalent Python
+  entry point. This is how the local demonstration and smoke testing were performed.
+- **Browser:** the LiveKit **Agent Console** at
+  `https://cloud.livekit.io/projects/<your-project>/agents/console` can be used to test the same
+  local worker with microphone access. No custom frontend was built.
 
 ### Manual test script used for verification
 
@@ -215,8 +216,8 @@ Then talk to the agent in either of these ways:
    answers and then resumes the next unfinished step instead of restarting the script.
 5. **Interruption:** while the agent is mid-sentence, start talking — it stops immediately, marks
    that reply as `interrupted=True`, and listens.
-6. Ask "what's my status?" — the LLM calls `check_verification_status` (logged as
-   `tool check_verification_status(...)`).
+6. Ask "what's my status?" — the LLM calls `check_verification_status`, and the result is rendered in
+   the terminal as a `VERIFICATION CHECK` block (customer name plus the PAN, bank and selfie status).
 7. Confirm the summary, answer the "anything else?" question, and end the call politely.
 8. **Idle test:** say nothing for ~12 s → "Are you still there?".
 
@@ -337,7 +338,6 @@ All settings have working defaults; only the three LiveKit credentials are requi
 | `TTS_FALLBACK_MODEL` | `deepgram/aura-2` | TTS fallback model (default voice) |
 | `USER_AWAY_TIMEOUT` | `12` | Seconds of silence before the "are you still there?" prompt |
 | `MAX_AWAY_PROMPTS` | `3` | Check-ins before the session shuts down |
-| `LOG_LEVEL` | `INFO` | Logging level for the agent logger |
 | `AGENT_SYSTEM_PROMPT` | *(unset)* | Overrides the entire system prompt from `prompts.py` |
 
 ---
@@ -361,10 +361,6 @@ All settings have working defaults; only the three LiveKit credentials are requi
 - **`allow_interruptions=True` is deprecated in the SDK's v2 roadmap** in favour of
   `turn_handling.interruption` (which this code also sets). It is kept explicitly because the
   assignment asks for it; the SDK prints a one-line deprecation warning when a session is built.
-- **Deviation from the original plan:** the plan's example fallback model `google/gemma-4-31b-it` is
-  **not** present in the model catalog bundled with `livekit-agents` 1.8.1, so the LLM fallback is
-  `google/gemini-2.5-flash-lite` (verified present in the catalog) instead. The plan's
-  `deepgram/nova-3` and `cartesia/sonic-3` choices were confirmed valid and kept.
 - **No automated test suite.** Behaviour was verified with a temporary offline validation script that
   asserts the model IDs, builds the session, exercises the summary/JSON helpers and the prompt
   override, plus manual end-to-end testing. An automated suite is listed under Production
@@ -447,7 +443,8 @@ All settings have working defaults; only the three LiveKit credentials are requi
         chat completion, `cartesia/sonic-3` returns 24 kHz audio, and `deepgram/nova-3` transcribes that
         audio back (round-trip transcript matches).
 - [ ] **Cloud deployment and the 2–3 minute demo recording are account-specific steps you run** with your
-      own LiveKit Cloud project and microphone (see section 7 for the exact commands). A local
-      `python agent.py dev` worker is already sufficient to record the demo.
+      own LiveKit Cloud project and microphone (see section 7 for the exact commands). The recorded
+      demo was made locally with `lk agent console`, which runs this worker and drives it from the
+      terminal.
 
 
