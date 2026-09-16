@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ from dotenv import load_dotenv
 from livekit import agents
 from livekit.agents import (
     Agent,
+    AgentServer,
     AgentSession,
     ConversationItemAddedEvent,
     ErrorEvent,
@@ -39,6 +41,7 @@ from livekit.agents import (
     JobProcess,
     RunContext,
     UserStateChangedEvent,
+    cli,
     function_tool,
     inference,
 )
@@ -50,11 +53,12 @@ from prompts import get_system_prompt
 
 load_dotenv()
 
+# No logging.basicConfig() here on purpose: it installed a second root handler
+# alongside the one LiveKit sets up in cli.run_app, so every LiveKit and app
+# record was printed twice. LiveKit's logging system now owns root and our
+# logger simply propagates to it - every logger.error/exception/info below still
+# emits, at LiveKit's level and format.
 logger = logging.getLogger("verification-agent")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 
 # ---------------------------------------------------------------------------
 # Models - every one is served by LiveKit Inference, so no provider API keys
@@ -137,7 +141,7 @@ class VerificationAssistant(Agent):
         """
         record = lookup_verification_status(customer_name)
         self._state.tool_lookup = record
-        logger.info("tool check_verification_status(%r) -> %s", customer_name, record)
+        _emit(_tool_block(record))
         return record
 
     async def on_user_turn_completed(
@@ -147,9 +151,127 @@ class VerificationAssistant(Agent):
         text = (new_message.text_content or "").strip()
         if text:
             return
-        logger.warning("Empty or whitespace STT transcript; skipping the LLM call")
+        _emit(f"{EMPTY_TRANSCRIPT_MARKER}  (empty STT transcript - LLM call skipped)")
         await self.session.say(EMPTY_TRANSCRIPT_PROMPT)
         raise StopResponse()
+
+
+# ---------------------------------------------------------------------------
+# Console presentation helpers
+#
+# Formatting only: these helpers never touch the pipeline. They replace the
+# previous logger.info() status/turn/tool lines so each application event is
+# printed exactly once and without the logging prefix, which keeps the terminal
+# readable during a demo. LiveKit's own logging is left completely alone, and
+# every error/exception still goes through the logger below.
+# ---------------------------------------------------------------------------
+LINE = "=" * 50
+THIN = "-" * 50
+
+
+def _encodable(text: str) -> bool:
+    """True when the active console can render ``text``.
+
+    Windows consoles are often cp1252/cp437, which cannot encode characters
+    such as the tick and cross used by the status box.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def _glyph(unicode_text: str, ascii_text: str) -> str:
+    """Use the prettier glyph where the console supports it, else plain ASCII."""
+    return unicode_text if _encodable(unicode_text) else ascii_text
+
+
+DASH = _glyph("—", "-")
+EMPTY_TRANSCRIPT_MARKER = f"[No speech detected {DASH} reprompting]"
+INTERRUPTED_MARKER = f"[INTERRUPTED {DASH} user started speaking]"
+
+
+def _emit(block: str) -> None:
+    """Print one presentation block to stdout, flushed so it shows up live.
+
+    Never raises: if the console cannot encode a character (spoken text can be
+    in any script) the character is replaced instead of breaking the turn.
+    """
+    try:
+        print(block, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        safe = block.encode(encoding, errors="replace").decode(
+            encoding, errors="replace"
+        )
+        print(safe, flush=True)
+
+
+def _banner(room: str) -> str:
+    """Startup banner: assistant identity, models in use and the job's room."""
+    return "\n".join(
+        [
+            LINE,
+            "     CUSTOMER VERIFICATION ASSISTANT",
+            LINE,
+            "Agent:  Aria (customer-verification-agent)",
+            f"Room:   {room}",
+            f"STT:    LiveKit Inference ({STT_MODEL})",
+            f"LLM:    LiveKit Inference ({LLM_MODEL})",
+            f"TTS:    LiveKit Inference ({TTS_MODEL})",
+            "Status: Ready",
+            LINE,
+        ]
+    )
+
+
+def _turn_block(role: str, text: str) -> str:
+    """One conversation turn: USER/ARIA label followed by the spoken text."""
+    speaker = {"user": "USER", "assistant": "ARIA"}.get(role, role.upper())
+    return f"{speaker}:\n> {text}"
+
+
+def _tool_block(record: dict[str, Any]) -> str:
+    """Readable rendering of the record returned by the status tool."""
+    lines = [
+        THIN,
+        "VERIFICATION CHECK",
+        THIN,
+        f"Customer: {record.get('customer_name') or '<unknown>'}",
+    ]
+    if record.get("found"):
+        yes, no = _glyph("✓", "[OK]"), _glyph("✗", "[--]")
+        pan = f"{yes} verified" if record.get("pan_verified") else f"{no} not verified"
+        bank = (
+            f"{yes} verified" if record.get("bank_verified") else f"{no} not verified"
+        )
+        selfie = (
+            f"{yes} uploaded" if record.get("selfie_uploaded") else f"{no} not uploaded"
+        )
+        lines += [f"PAN:      {pan}", f"Bank:     {bank}", f"Selfie:   {selfie}"]
+    else:
+        lines.append("Status:   no record found")
+    lines.append(THIN)
+    return "\n".join(lines)
+
+
+def _session_block(state: SessionState, reason: Any) -> str:
+    """Session-end summary built only from state that was already collected."""
+    interruptions = sum(1 for turn in state.turns if turn.get("interrupted"))
+    tool_lookups = 1 if state.tool_lookup else 0
+    return "\n".join(
+        [
+            LINE,
+            "SESSION COMPLETE",
+            LINE,
+            f"Turns: {len(state.turns)}   Interruptions: {interruptions}   "
+            f"Tool lookups: {tool_lookups}",
+            f"Reason: {reason}",
+            LINE,
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +292,9 @@ def _log_latency(metrics: dict[str, Any]) -> None:
             return f"{value * 1000:.0f}ms"
         return "n/a"
 
-    logger.info(
-        "LATENCY e2e_latency=%s llm_node_ttft=%s tts_node_ttfb=%s",
-        as_ms("e2e_latency"),
-        as_ms("llm_node_ttft"),
-        as_ms("tts_node_ttfb"),
+    _emit(
+        f"[LATENCY]  e2e={as_ms('e2e_latency')}  "
+        f"llm_ttft={as_ms('llm_node_ttft')}  tts_ttfb={as_ms('tts_node_ttfb')}"
     )
 
 
@@ -349,14 +469,26 @@ def _build_session(vad: silero.VAD) -> AgentSession:
     )
 
 
+# The LiveKit CLI (`lk agent console`, `lk agent dev`, `lk agent deploy`)
+# discovers the agent through the module-level ``server`` variable, so the agent
+# is registered on an AgentServer instead of being handed to run_app as
+# WorkerOptions. Everything below the wiring is unchanged.
+server = AgentServer()
+
+
 def prewarm(proc: JobProcess) -> None:
     """Load the VAD once per worker process so jobs start faster."""
     proc.userdata["vad"] = silero.VAD.load()
 
 
+# Prewarm hook for the AgentServer (runs once per worker process).
+server.setup_fnc = prewarm
+
+
+@server.rtc_session(agent_name="customer-verification-agent")
 async def entrypoint(ctx: JobContext) -> None:
     ctx.log_context_fields = {"room": ctx.room.name}
-    logger.info("Job assigned for room %s", ctx.room.name)
+    _emit(_banner(ctx.room.name))
 
     state = SessionState(room_name=ctx.room.name)
     vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
@@ -372,9 +504,9 @@ async def entrypoint(ctx: JobContext) -> None:
         role = item.role
         text = item.text_content or ""
         interrupted = bool(getattr(item, "interrupted", False))
-        logger.info(
-            "TURN role=%s interrupted=%s text=%r", role, interrupted, text
-        )
+        if interrupted:
+            _emit(INTERRUPTED_MARKER)
+        _emit(_turn_block(role, text))
 
         state.turns.append(
             {
@@ -434,7 +566,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @session.on("close")
     def on_close(ev: Any) -> None:
-        logger.info("Session closed (reason=%s)", getattr(ev, "reason", ev))
+        _emit(_session_block(state, getattr(ev, "reason", ev)))
         if state.away_task is not None:
             state.away_task.cancel()
         try:
@@ -456,18 +588,17 @@ async def _prompt_if_away(session: AgentSession, state: SessionState) -> None:
     """
     try:
         if state.away_prompts >= MAX_AWAY_PROMPTS:
-            logger.info(
-                "Customer still silent after %s check-ins; ending the session",
-                state.away_prompts,
+            _emit(
+                f"[No speech detected {DASH} ending session]  "
+                f"(no answer after {state.away_prompts} check-ins)"
             )
             session.shutdown()
             return
 
         state.away_prompts += 1
-        logger.info(
-            "No speech detected; re-prompting (attempt %s/%s)",
-            state.away_prompts,
-            MAX_AWAY_PROMPTS,
+        _emit(
+            f"{EMPTY_TRANSCRIPT_MARKER}  "
+            f"(attempt {state.away_prompts}/{MAX_AWAY_PROMPTS})"
         )
         await session.generate_reply(instructions=AWAY_INSTRUCTIONS)
     except asyncio.CancelledError:
@@ -478,9 +609,4 @@ async def _prompt_if_away(session: AgentSession, state: SessionState) -> None:
 
 
 if __name__ == "__main__":
-    agents.cli.run_app(
-        agents.WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="customer-verification-agent",
-        )
-    )
+    cli.run_app(server)
